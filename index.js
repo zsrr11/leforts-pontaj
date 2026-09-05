@@ -20,11 +20,14 @@ const Database = require("better-sqlite3");
 
 const TOKEN = process.env.DISCORD_TOKEN;
 
-// Canalul unde sunt cele 3 butoane
+// Canalul cu cele 3 butoane
 const PONTAJ_CHANNEL_ID = "1545859782391504916";
 
-// Canalul unde administratorii văd pontajele
+// Canalul pentru administrare
 const ADMIN_CHANNEL_ID = "1545873888494358639";
+
+// Fusul orar folosit pentru programul de pontaj
+const TIME_ZONE = "Europe/Bucharest";
 
 if (!TOKEN) {
     console.error("Lipsește DISCORD_TOKEN!");
@@ -44,6 +47,10 @@ db.prepare(`
         clock_in INTEGER DEFAULT NULL
     )
 `).run();
+
+// =========================
+// FUNCȚII UTILE
+// =========================
 
 function getUser(userId) {
     let user = db
@@ -73,6 +80,51 @@ function formatTime(seconds) {
     return `${hours}h ${minutes}m`;
 }
 
+// Ora locală din România
+function getRomaniaTime() {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+        timeZone: TIME_ZONE,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+    }).formatToParts(new Date());
+
+    const result = {};
+
+    for (const part of parts) {
+        if (part.type !== "literal") {
+            result[part.type] = Number(part.value);
+        }
+    }
+
+    return result;
+}
+
+// Verifică dacă în acest moment se poate porni pontajul.
+// Program: 10:00 - 02:00
+function isPontajOpen() {
+    const time = getRomaniaTime();
+
+    const minutes = time.hour * 60 + time.minute;
+
+    // 10:00 = 600
+    // 02:00 = 120
+
+    return minutes >= 600 || minutes < 120;
+}
+
+// Câte secunde au trecut de la ora 02:00,
+// folosind ora României.
+function secondsSinceTwoAM() {
+    const time = getRomaniaTime();
+
+    const minutesAfterTwo =
+        (time.hour * 60 + time.minute) - 120;
+
+    return Math.max(0, minutesAfterTwo * 60 + time.second);
+}
+
 // =========================
 // CLIENT DISCORD
 // =========================
@@ -93,9 +145,84 @@ const commands = [
         .setDescription("Vezi pontajele tuturor angajaților"),
 
     new SlashCommandBuilder()
+        .setName("porniti")
+        .setDescription("Vezi cine este momentan în tură"),
+
+    new SlashCommandBuilder()
         .setName("resetpontaj")
         .setDescription("Resetează pontajele pentru noua săptămână")
 ].map(command => command.toJSON());
+
+// =========================
+// ÎNCHIDERE AUTOMATĂ LA 02:00
+// =========================
+
+function autoStopShifts() {
+
+    const time = getRomaniaTime();
+
+    // Între 02:00 și 10:00 nu trebuie să existe ture active.
+    const minutes = time.hour * 60 + time.minute;
+
+    if (minutes < 120 || minutes >= 600) {
+        // Dacă este înainte de 02:00, nu facem nimic.
+        if (minutes >= 120 && minutes < 600) {
+            // codul este tratat mai jos
+        } else if (minutes < 120) {
+            return;
+        }
+    }
+
+    // În intervalul 02:00 - 10:00 închidem toate turele.
+    if (minutes >= 120 && minutes < 600) {
+
+        const activeUsers = db
+            .prepare(`
+                SELECT *
+                FROM users
+                WHERE clock_in IS NOT NULL
+            `)
+            .all();
+
+        if (activeUsers.length === 0) return;
+
+        const now = Math.floor(Date.now() / 1000);
+        const secondsFromTwo = secondsSinceTwoAM();
+
+        // Momentul exact aproximativ al orei 02:00
+        const cutoff = now - secondsFromTwo;
+
+        for (const user of activeUsers) {
+
+            const workedSeconds = Math.max(
+                0,
+                cutoff - user.clock_in
+            );
+
+            const newTotal =
+                user.total_seconds + workedSeconds;
+
+            db.prepare(`
+                UPDATE users
+                SET total_seconds = ?, clock_in = NULL
+                WHERE user_id = ?
+            `).run(newTotal, user.user_id);
+
+            console.log(
+                `Tura utilizatorului ${user.user_id} a fost oprită automat la 02:00.`
+            );
+        }
+    }
+}
+
+// Verificăm periodic dacă există ture care trebuie închise.
+setInterval(() => {
+    try {
+        autoStopShifts();
+    } catch (error) {
+        console.error("Eroare la oprirea automată:", error);
+    }
+}, 30000);
 
 // =========================
 // PANOU PONTAJ
@@ -107,7 +234,8 @@ async function sendPontajMessage(channel) {
         .setColor("#2b2d31")
         .setTitle("🏢 LEFORTS — PONTAJ")
         .setDescription(
-            "Folosește butoanele de mai jos pentru a-ți înregistra tura."
+            "Folosește butoanele de mai jos pentru a-ți înregistra tura.\n\n" +
+            "🕐 Program pontaj: **10:00 - 02:00**"
         );
 
     const row = new ActionRowBuilder().addComponents(
@@ -131,8 +259,10 @@ async function sendPontajMessage(channel) {
             .setStyle(ButtonStyle.Primary)
     );
 
-    // Caută un panou existent pentru a evita duplicatele
-    const messages = await channel.messages.fetch({ limit: 50 });
+    // Căutăm panoul existent ca să nu creăm duplicate.
+    const messages = await channel.messages.fetch({
+        limit: 50
+    });
 
     const existingMessage = messages.find(message =>
         message.author.id === client.user.id &&
@@ -141,6 +271,7 @@ async function sendPontajMessage(channel) {
     );
 
     if (existingMessage) {
+
         await existingMessage.edit({
             embeds: [embed],
             components: [row]
@@ -175,9 +306,23 @@ client.once(Events.ClientReady, async () => {
         status: "online"
     });
 
-    // Înregistrează comenzile slash pe serverele unde se află botul
+    // Închide eventualele ture rămase active
+    // dacă botul a fost oprit în jurul orei 02:00.
     try {
-        const rest = new REST({ version: "10" }).setToken(TOKEN);
+        autoStopShifts();
+    } catch (error) {
+        console.error(
+            "Eroare la verificarea turelor active:",
+            error
+        );
+    }
+
+    // Înregistrează comenzile slash
+    try {
+
+        const rest = new REST({
+            version: "10"
+        }).setToken(TOKEN);
 
         for (const guild of client.guilds.cache.values()) {
 
@@ -191,21 +336,35 @@ client.once(Events.ClientReady, async () => {
                 }
             );
 
-            console.log(`Comenzile au fost înregistrate pe serverul ${guild.name}.`);
+            console.log(
+                `Comenzile au fost înregistrate pe serverul ${guild.name}.`
+            );
         }
+
     } catch (error) {
-        console.error("Eroare la înregistrarea comenzilor:", error);
+
+        console.error(
+            "Eroare la înregistrarea comenzilor:",
+            error
+        );
     }
 
     // Creează / actualizează panoul
     try {
-        const channel = await client.channels.fetch(PONTAJ_CHANNEL_ID);
+
+        const channel =
+            await client.channels.fetch(PONTAJ_CHANNEL_ID);
 
         if (channel) {
             await sendPontajMessage(channel);
         }
+
     } catch (error) {
-        console.error("Nu pot accesa canalul de pontaj:", error);
+
+        console.error(
+            "Nu pot accesa canalul de pontaj:",
+            error
+        );
     }
 });
 
@@ -213,249 +372,443 @@ client.once(Events.ClientReady, async () => {
 // INTERACȚIUNI
 // =========================
 
-client.on(Events.InteractionCreate, async interaction => {
+client.on(
+    Events.InteractionCreate,
+    async interaction => {
 
-    // ==================================================
-    // BUTOANE
-    // ==================================================
+        // ==================================================
+        // BUTOANE
+        // ==================================================
 
-    if (interaction.isButton()) {
+        if (interaction.isButton()) {
 
-        const userId = interaction.user.id;
-        const user = getUser(userId);
+            const userId = interaction.user.id;
+            const user = getUser(userId);
 
-        // -------------------------
-        // PORNEȘTE
-        // -------------------------
+            // -------------------------
+            // PORNEȘTE
+            // -------------------------
 
-        if (interaction.customId === "pontaj_start") {
+            if (interaction.customId === "pontaj_start") {
 
-            if (user.clock_in) {
+                // Verificăm programul 10:00 - 02:00
+                if (!isPontajOpen()) {
+
+                    return interaction.reply({
+                        content:
+                            "⛔ **Pontajul este închis momentan.**\n\n" +
+                            "🕐 Programul de pontaj este **10:00 - 02:00**.",
+                        ephemeral: true
+                    });
+                }
+
+                if (user.clock_in) {
+
+                    return interaction.reply({
+                        content:
+                            "⚠️ **Ești deja în tură!**",
+                        ephemeral: true
+                    });
+                }
+
+                const now =
+                    Math.floor(Date.now() / 1000);
+
+                db.prepare(`
+                    UPDATE users
+                    SET clock_in = ?
+                    WHERE user_id = ?
+                `).run(now, userId);
+
                 return interaction.reply({
-                    content: "⚠️ Ești deja în tură!",
+                    content:
+                        "🟢 **Tura a început!**\n" +
+                        "Pontajul tău a fost pornit.",
                     ephemeral: true
                 });
             }
 
-            const now = Math.floor(Date.now() / 1000);
+            // -------------------------
+            // OPREȘTE
+            // -------------------------
 
-            db.prepare(`
-                UPDATE users
-                SET clock_in = ?
-                WHERE user_id = ?
-            `).run(now, userId);
+            if (interaction.customId === "pontaj_stop") {
 
-            return interaction.reply({
-                content:
-                    "🟢 **Tura a început!**\n" +
-                    "Pontajul tău a fost pornit.",
-                ephemeral: true
-            });
-        }
+                if (!user.clock_in) {
 
-        // -------------------------
-        // OPREȘTE
-        // -------------------------
+                    return interaction.reply({
+                        content:
+                            "⚠️ **Nu ai o tură activă.**",
+                        ephemeral: true
+                    });
+                }
 
-        if (interaction.customId === "pontaj_stop") {
+                const now =
+                    Math.floor(Date.now() / 1000);
 
-            if (!user.clock_in) {
+                let stopTime = now;
+
+                // Dacă cineva încearcă să oprească după 02:00,
+                // limităm tura la ora 02:00.
+                if (!isPontajOpen()) {
+
+                    const time = getRomaniaTime();
+
+                    const minutes =
+                        time.hour * 60 + time.minute;
+
+                    if (minutes >= 120 && minutes < 600) {
+
+                        stopTime =
+                            now - secondsSinceTwoAM();
+                    }
+                }
+
+                const workedSeconds =
+                    Math.max(0, stopTime - user.clock_in);
+
+                const newTotal =
+                    user.total_seconds + workedSeconds;
+
+                db.prepare(`
+                    UPDATE users
+                    SET total_seconds = ?, clock_in = NULL
+                    WHERE user_id = ?
+                `).run(newTotal, userId);
+
                 return interaction.reply({
-                    content: "⚠️ Nu ai o tură activă.",
+                    content:
+                        `🔴 **Tura a fost oprită!**\n\n` +
+                        `⏱️ Durata turei: **${formatTime(workedSeconds)}**\n` +
+                        `📊 Timp înregistrat: **${formatTime(newTotal)}**`,
                     ephemeral: true
                 });
             }
 
-            const now = Math.floor(Date.now() / 1000);
-            const workedSeconds = now - user.clock_in;
+            // -------------------------
+            // TIMPUL MEU
+            // -------------------------
 
-            const newTotal =
-                user.total_seconds + workedSeconds;
+            if (interaction.customId === "pontaj_time") {
 
-            db.prepare(`
-                UPDATE users
-                SET total_seconds = ?, clock_in = NULL
-                WHERE user_id = ?
-            `).run(newTotal, userId);
+                let total =
+                    user.total_seconds;
 
-            return interaction.reply({
-                content:
-                    `🔴 **Tura a fost oprită!**\n\n` +
-                    `⏱️ Durata turei: **${formatTime(workedSeconds)}**\n` +
-                    `📊 Timp înregistrat: **${formatTime(newTotal)}**`,
-                ephemeral: true
-            });
-        }
+                let status =
+                    "🔴 Nu ești în tură";
 
-        // -------------------------
-        // TIMPUL MEU
-        // -------------------------
+                if (user.clock_in) {
 
-        if (interaction.customId === "pontaj_time") {
+                    const now =
+                        Math.floor(Date.now() / 1000);
 
-            let total = user.total_seconds;
-            let status = "🔴 Nu ești în tură";
+                    let currentTime = now;
 
-            if (user.clock_in) {
+                    // Dacă este după 02:00, timpul activ
+                    // se calculează doar până la 02:00.
+                    if (!isPontajOpen()) {
 
-                const now = Math.floor(Date.now() / 1000);
+                        const time =
+                            getRomaniaTime();
 
-                total += now - user.clock_in;
+                        const minutes =
+                            time.hour * 60 + time.minute;
 
-                status = "🟢 Ești în tură";
+                        if (
+                            minutes >= 120 &&
+                            minutes < 600
+                        ) {
+                            currentTime =
+                                now - secondsSinceTwoAM();
+                        }
+                    }
+
+                    total += Math.max(
+                        0,
+                        currentTime - user.clock_in
+                    );
+
+                    status =
+                        "🟢 Ești în tură";
+                }
+
+                return interaction.reply({
+                    content:
+                        `⏱️ **TIMPUL MEU**\n\n` +
+                        `Timp înregistrat: **${formatTime(total)}**\n\n` +
+                        `Status: ${status}`,
+                    ephemeral: true
+                });
             }
 
+            return;
+        }
+
+        // ==================================================
+        // COMENZI SLASH
+        // ==================================================
+
+        if (!interaction.isChatInputCommand()) {
+            return;
+        }
+
+        // Comenzile administrative funcționează
+        // doar în canalul de administrare.
+        if (interaction.channelId !== ADMIN_CHANNEL_ID) {
+
             return interaction.reply({
                 content:
-                    `⏱️ **TIMPUL MEU**\n\n` +
-                    `Timp înregistrat: **${formatTime(total)}**\n\n` +
-                    `Status: ${status}`,
+                    "⛔ Această comandă poate fi folosită doar în canalul de administrare.",
                 ephemeral: true
             });
         }
 
-        return;
-    }
-
-    // ==================================================
-    // COMENZI SLASH
-    // ==================================================
-
-    if (!interaction.isChatInputCommand()) return;
-
-    // Comenzile sunt permise doar în canalul de admin
-    if (interaction.channelId !== ADMIN_CHANNEL_ID) {
-
-        return interaction.reply({
-            content:
-                "⛔ Această comandă poate fi folosită doar în canalul de administrare.",
-            ephemeral: true
-        });
-    }
-
-    // Doar administratori
-    if (!interaction.memberPermissions.has(
-        PermissionFlagsBits.Administrator
-    )) {
-
-        return interaction.reply({
-            content:
-                "⛔ Nu ai permisiunea de a folosi această comandă.",
-            ephemeral: true
-        });
-    }
-
-    // ==================================================
-    // /PONTAJE
-    // ==================================================
-
-    if (interaction.commandName === "pontaje") {
-
-        const users = db
-            .prepare(`
-                SELECT *
-                FROM users
-                ORDER BY total_seconds DESC
-            `)
-            .all();
-
-        if (users.length === 0) {
+        // Doar administratorii
+        if (
+            !interaction.memberPermissions.has(
+                PermissionFlagsBits.Administrator
+            )
+        ) {
 
             return interaction.reply({
                 content:
+                    "⛔ Nu ai permisiunea de a folosi această comandă.",
+                ephemeral: true
+            });
+        }
+
+        // ==================================================
+        // /PONTAJE
+        // ==================================================
+
+        if (interaction.commandName === "pontaje") {
+
+            const users = db
+                .prepare(`
+                    SELECT *
+                    FROM users
+                    ORDER BY total_seconds DESC
+                `)
+                .all();
+
+            if (users.length === 0) {
+
+                return interaction.reply({
+                    content:
+                        "📊 **PONTAJ ANGAJAȚI**\n\n" +
+                        "Nu există încă pontaje înregistrate.",
+                    ephemeral: false
+                });
+            }
+
+            let text =
+                "📊 **PONTAJ ANGAJAȚI**\n\n";
+
+            for (const user of users) {
+
+                let total =
+                    user.total_seconds;
+
+                let status =
+                    "🔴 Nu este în tură";
+
+                if (user.clock_in) {
+
+                    const now =
+                        Math.floor(Date.now() / 1000);
+
+                    let currentTime = now;
+
+                    if (!isPontajOpen()) {
+
+                        const time =
+                            getRomaniaTime();
+
+                        const minutes =
+                            time.hour * 60 + time.minute;
+
+                        if (
+                            minutes >= 120 &&
+                            minutes < 600
+                        ) {
+                            currentTime =
+                                now - secondsSinceTwoAM();
+                        }
+                    }
+
+                    total += Math.max(
+                        0,
+                        currentTime - user.clock_in
+                    );
+
+                    status =
+                        "🟢 ÎN TURĂ";
+                }
+
+                let member;
+
+                try {
+
+                    member =
+                        await interaction.guild.members.fetch(
+                            user.user_id
+                        );
+
+                } catch {
+
+                    member = null;
+                }
+
+                const name = member
+                    ? member.displayName
+                    : `ID: ${user.user_id}`;
+
+                text +=
+                    `👤 **${name}**\n` +
+                    `⏱️ ${formatTime(total)}\n` +
+                    `${status}\n\n`;
+            }
+
+            if (text.length > 1900) {
+
+                text =
                     "📊 **PONTAJ ANGAJAȚI**\n\n" +
-                    "Nu există încă pontaje înregistrate.",
+                    "Sunt prea mulți angajați pentru un singur mesaj.";
+            }
+
+            return interaction.reply({
+                content: text,
                 ephemeral: false
             });
         }
 
-        let text = "📊 **PONTAJ ANGAJAȚI**\n\n";
+        // ==================================================
+        // /PORNITI
+        // ==================================================
 
-        for (const user of users) {
+        if (interaction.commandName === "porniti") {
 
-            let total = user.total_seconds;
-            let status = "🔴 Nu este în tură";
+            const users = db
+                .prepare(`
+                    SELECT *
+                    FROM users
+                    WHERE clock_in IS NOT NULL
+                    ORDER BY clock_in ASC
+                `)
+                .all();
 
-            if (user.clock_in) {
+            if (users.length === 0) {
 
-                const now = Math.floor(Date.now() / 1000);
-
-                total += now - user.clock_in;
-
-                status = "🟢 ÎN TURĂ";
+                return interaction.reply({
+                    content:
+                        "🟢 **ANGAJAȚI ÎN TURĂ**\n\n" +
+                        "Nu este nimeni în tură momentan.",
+                    ephemeral: false
+                });
             }
 
-            let member;
+            let text =
+                "🟢 **ANGAJAȚI ÎN TURĂ**\n\n";
 
-            try {
-                member = await interaction.guild.members.fetch(
-                    user.user_id
-                );
-            } catch {
-                member = null;
+            const now =
+                Math.floor(Date.now() / 1000);
+
+            for (const user of users) {
+
+                let currentTime = now;
+
+                // Limităm timpul la 02:00
+                if (!isPontajOpen()) {
+
+                    const time =
+                        getRomaniaTime();
+
+                    const minutes =
+                        time.hour * 60 + time.minute;
+
+                    if (
+                        minutes >= 120 &&
+                        minutes < 600
+                    ) {
+                        currentTime =
+                            now - secondsSinceTwoAM();
+                    }
+                }
+
+                const activeSeconds =
+                    Math.max(
+                        0,
+                        currentTime - user.clock_in
+                    );
+
+                let member;
+
+                try {
+
+                    member =
+                        await interaction.guild.members.fetch(
+                            user.user_id
+                        );
+
+                } catch {
+
+                    member = null;
+                }
+
+                const name = member
+                    ? member.displayName
+                    : `ID: ${user.user_id}`;
+
+                text +=
+                    `👤 **${name}**\n` +
+                    `⏱️ În tură de **${formatTime(activeSeconds)}**\n\n`;
             }
-
-            const name = member
-                ? member.displayName
-                : `ID: ${user.user_id}`;
 
             text +=
-                `👤 **${name}**\n` +
-                `⏱️ ${formatTime(total)}\n` +
-                `${status}\n\n`;
+                `👥 **Total în tură: ${users.length}**`;
+
+            return interaction.reply({
+                content: text,
+                ephemeral: false
+            });
         }
 
-        // Discord are limită de caractere pe mesaj.
-        if (text.length > 1900) {
+        // ==================================================
+        // /RESETPONTAJ
+        // ==================================================
 
-            text =
-                "📊 **PONTAJ ANGAJAȚI**\n\n" +
-                "Sunt prea mulți angajați pentru un singur mesaj. " +
-                "Vom îmbunătăți lista cu paginare ulterior.";
+        if (interaction.commandName === "resetpontaj") {
+
+            const now =
+                Math.floor(Date.now() / 1000);
+
+            // Angajații care NU sunt în tură
+            // pornesc săptămâna de la 0.
+            db.prepare(`
+                UPDATE users
+                SET total_seconds = 0
+                WHERE clock_in IS NULL
+            `).run();
+
+            // Angajații care SUNT în tură:
+            // timpul vechi se resetează, dar tura continuă.
+            db.prepare(`
+                UPDATE users
+                SET total_seconds = 0,
+                    clock_in = ?
+                WHERE clock_in IS NOT NULL
+            `).run(now);
+
+            return interaction.reply({
+                content:
+                    "🔄 **Pontajele au fost resetate!**\n\n" +
+                    "Săptămâna nouă a început.\n" +
+                    "Turele active continuă de la momentul resetării.",
+                ephemeral: false
+            });
         }
-
-        return interaction.reply({
-            content: text,
-            ephemeral: false
-        });
     }
-
-    // ==================================================
-    // /RESETPONTAJ
-    // ==================================================
-
-    if (interaction.commandName === "resetpontaj") {
-
-        const now = Math.floor(Date.now() / 1000);
-
-        // Pentru cei care NU sunt în tură:
-        // resetăm complet timpul.
-        db.prepare(`
-            UPDATE users
-            SET total_seconds = 0
-            WHERE clock_in IS NULL
-        `).run();
-
-        // Pentru cei care SUNT în tură:
-        // resetăm timpul și pornim o nouă perioadă
-        // exact din momentul resetării.
-        db.prepare(`
-            UPDATE users
-            SET total_seconds = 0,
-                clock_in = ?
-            WHERE clock_in IS NOT NULL
-        `).run(now);
-
-        return interaction.reply({
-            content:
-                "🔄 **Pontajele au fost resetate!**\n\n" +
-                "Săptămâna nouă a început.\n" +
-                "Angajații care erau în tură au rămas în tură, " +
-                "iar timpul lor se calculează de la momentul resetării.",
-            ephemeral: false
-        });
-    }
-});
+);
 
 // =========================
 // LOGIN
