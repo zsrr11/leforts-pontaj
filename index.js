@@ -38,7 +38,8 @@ if (!TOKEN) {
 // BAZA DE DATE
 // =========================
 
-const db = new Database("pontaj.db");
+const db = new Database("/app/data/pontaj.db");
+
 
 db.prepare(`
     CREATE TABLE IF NOT EXISTS users (
