@@ -68,6 +68,25 @@ const client = new Client({
         GatewayIntentBits.Guilds
     ]
 });
+client.once(Events.ClientReady, async () => {
+    console.log(`LeForts este online ca ${client.user.tag}`);
+
+    client.user.setPresence({
+        activities: [
+            {
+                name: "Pontaj FiveM"
+            }
+        ],
+        status: "online"
+    });
+
+    const channel = await client.channels.fetch("1545859782391504916");
+
+    if (channel) {
+        await sendPontajMessage(channel);
+        console.log("Panoul de pontaj a fost trimis.");
+    }
+});
 
 client.once(Events.ClientReady, async () => {
     console.log(`LeForts este online ca ${client.user.tag}`);
