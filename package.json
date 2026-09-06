@@ -11,6 +11,6 @@
     "discord.js": "^14.22.1"
   },
   "engines": {
-    "node": ">=20"
+    "node": "20.x"
   }
 }
