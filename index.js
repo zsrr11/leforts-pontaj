@@ -21,10 +21,10 @@ const Database = require("better-sqlite3");
 const TOKEN = process.env.DISCORD_TOKEN;
 
 // Canalul cu cele 3 butoane
-const PONTAJ_CHANNEL_ID = "1545859782391504916";
+const PONTAJ_CHANNEL_ID = "1548833224652750939";
 
 // Canalul pentru administrare
-const ADMIN_CHANNEL_ID = "1545873888494358639";
+const ADMIN_CHANNEL_ID = "1548833636780867604";
 
 // Fusul orar folosit pentru programul de pontaj
 const TIME_ZONE = "Europe/Bucharest";
